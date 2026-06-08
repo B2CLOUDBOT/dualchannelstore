@@ -3035,7 +3035,7 @@ async def cmd_list_granted_and_b2(message: types.Message):
     users = await db.granted_users.find({}).sort("granted_at", -1).to_list(200)
     hist = await b2_history_col.find({}).sort("sent_at", -1).to_list(5)
 
-text = "👥 *Granted Users*\n━━━━━━━━━━━━━━━━━━\n"
+    text = "👥 *Granted Users*\n━━━━━━━━━━━━━━━━━━\n"
     if not users:
         text += "Koi granted user nahi.\n"
     else:
