@@ -30,7 +30,8 @@ API_TOKEN = os.environ["API_TOKEN"]
 MONGO_URI = os.environ["MONGO_URI"]
 AUTO_DELETE_AFTER_SEC = int(os.environ.get("AUTO_DELETE_AFTER_SEC", "3600"))  # 1 hour
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-STORAGE_CHANNEL = int(os.environ["STORAGE_CHANNEL"])
+STORAGE_CHANNEL_1 = int(os.environ["STORAGE_CHANNEL_1"])
+STORAGE_CHANNEL_2 = int(os.environ["STORAGE_CHANNEL_2"])
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -329,45 +330,72 @@ async def notify_album_update(album_id: str, text: str):
             await asyncio.sleep(0.05)
         except Exception:
             pass
+STORAGE_CHANNEL_1 = int(os.environ["STORAGE_CHANNEL_1"])
+STORAGE_CHANNEL_2 = int(os.environ["STORAGE_CHANNEL_2"])
 
 async def send_to_storage(fid: str, mtype: str, text_content: str = ""):
     for attempt in range(5):
         try:
-            if mtype == "text":
-                msg = await bot.send_message(STORAGE_CHANNEL, text_content)
-                return msg.message_id, 0
-            elif mtype == "video":
-                msg = await bot.send_video(STORAGE_CHANNEL, fid)
-                fsize = msg.video.file_size if msg.video else 0
-            elif mtype == "document":
-                msg = await bot.send_document(STORAGE_CHANNEL, fid)
-                fsize = msg.document.file_size if msg.document else 0
-            elif mtype == "audio":
-                msg = await bot.send_audio(STORAGE_CHANNEL, fid)
-                fsize = msg.audio.file_size if msg.audio else 0
-            elif mtype == "voice":
-                msg = await bot.send_voice(STORAGE_CHANNEL, fid)
-                fsize = msg.voice.file_size if msg.voice else 0
-            else:
-                msg = await bot.send_photo(STORAGE_CHANNEL, fid)
-                fsize = msg.photo[-1].file_size if msg.photo else 0
-            return msg.message_id, fsize
+            channels = [STORAGE_CHANNEL_1, STORAGE_CHANNEL_2]
+            first_msg_id = None
+            fsize = 0
+
+            for channel in channels:
+
+                if mtype == "text":
+                    msg = await bot.send_message(channel, text_content)
+
+                elif mtype == "video":
+                    msg = await bot.send_video(channel, fid)
+                    if not fsize:
+                        fsize = msg.video.file_size if msg.video else 0
+
+                elif mtype == "document":
+                    msg = await bot.send_document(channel, fid)
+                    if not fsize:
+                        fsize = msg.document.file_size if msg.document else 0
+
+                elif mtype == "audio":
+                    msg = await bot.send_audio(channel, fid)
+                    if not fsize:
+                        fsize = msg.audio.file_size if msg.audio else 0
+
+                elif mtype == "voice":
+                    msg = await bot.send_voice(channel, fid)
+                    if not fsize:
+                        fsize = msg.voice.file_size if msg.voice else 0
+
+                else:
+                    msg = await bot.send_photo(channel, fid)
+                    if not fsize:
+                        fsize = msg.photo[-1].file_size if msg.photo else 0
+
+                if first_msg_id is None:
+                    first_msg_id = msg.message_id
+
+            return first_msg_id, fsize
+
         except Exception as e:
             err_str = str(e)
+
             if "Too Many Requests" in err_str or "Flood" in err_str:
                 wait_match = re.search(r"retry after (\d+)", err_str)
                 wait_sec = int(wait_match.group(1)) if wait_match else 30
                 wait_sec += 2
-                logger.warning(f"Flood control! Waiting {wait_sec}s (attempt {attempt+1}/5)")
+
+                logger.warning(
+                    f"Flood control! Waiting {wait_sec}s (attempt {attempt+1}/5)"
+                )
+
                 await asyncio.sleep(wait_sec)
                 continue
-            else:
-                logger.error(f"Storage send error: {e}")
-                return None, 0
+
+            logger.error(f"Storage send error: {e}")
+            return None, 0
+
     logger.error(f"Storage send failed after 5 retries: {fid}")
     return None, 0
-
-
+    
 async def send_document_retry(chat_id: int, file_bytes: bytes, filename: str, caption: str = "", parse_mode: str | None = None, retries: int = 5):
     """Fix for /zip error: name 'send_document_retry' is not defined.
     Bytes ko BufferedInputFile bana ke retry ke sath document send karta hai.
