@@ -3663,19 +3663,22 @@ COMMANDS_GRANTED = [
     BotCommand(command="info", description="Get full album details & user info"),
     BotCommand(command="stats", description="View advanced cloud statistics"),
     BotCommand(command="id", description="Get your Telegram ID info"),
+
+    # Share
+    BotCommand(command="b2", description="Share album: /b2 <id> @user1 @user2"),
 ]
 
-# Owner + @b2gpt: granted menu plus the Share & Admin/Owner commands.
+# Owner + @b2gpt: granted menu plus the Admin/Owner commands.
 COMMANDS_OWNER = COMMANDS_GRANTED + [
-    BotCommand(command="b2", description="Share album: /b2 <id> @user1 @user2"),
     BotCommand(command="grant", description="Grant bot access to a user (Owner only)"),
     BotCommand(command="denied", description="Revoke access from a user (Owner only)"),
     BotCommand(command="list", description="List granted users & b2 history"),
     BotCommand(command="makelist", description="Update your checklist: /makelist <title>"),
 ]
 
-# Normal + denied users: only /id.
+# Normal + denied users: only /start and /id.
 COMMANDS_BASIC = [
+    BotCommand(command="start", description="Start bot onboarding"),
     BotCommand(command="id", description="Get your Telegram ID info"),
 ]
 
