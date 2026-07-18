@@ -13,6 +13,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from keep_alive import start_server
 
 # ============================================================
@@ -973,6 +974,8 @@ async def cmd_start(message: types.Message):
                 {"$set": {"user_id": uid, "username": username, "full_name": message.from_user.full_name, "pending": False}}
             )
             logger.info(f"✅ Pending grant activated: @{username} = {uid}")
+
+    await apply_command_menu(uid)
 
     if not is_admin(uid):
         reg_code = await get_or_create_reg_code(uid)
@@ -3217,6 +3220,7 @@ async def cmd_grant(message: types.Message):
         username = username or user_doc.get("username", "")
         await db.granted_users.update_one({"user_id": uid}, {"$set": {"user_id": uid, "username": username or "", "pending": False, "granted_at": now_db()}}, upsert=True)
         await db.denied_users.delete_one({"user_id": uid})
+        await apply_command_menu(uid)
         try:
             await bot.send_message(uid, "🎉 *Access Granted!*\n\nAb aap bot use kar sakte ho.\n📁 Album create/add/view/share available hai.\n\n/start dabao aur commands dekho.", parse_mode="Markdown")
         except Exception as e:
@@ -3271,6 +3275,7 @@ async def cmd_denied(message: types.Message):
                 upsert=True
             )
             await notify_denied_user(uid)
+            await apply_command_menu(uid)
             await message.answer(f"🚫 Access removed!\n🆔 `{uid}`", parse_mode="Markdown")
         else:
             await message.answer(f"⚠️ `{uid}` list mein nahi tha.", parse_mode="Markdown")
@@ -3302,6 +3307,7 @@ async def cmd_denied(message: types.Message):
             )
             if uid_saved:
                 await notify_denied_user(uid_saved)
+                await apply_command_menu(uid_saved)
             await message.answer(f"🚫 @{username} access removed!", parse_mode="Markdown")
         else:
             await message.answer(f"⚠️ @{username} list mein nahi tha.", parse_mode="Markdown")
@@ -3621,6 +3627,99 @@ async def error_handler(event: types.ErrorEvent):
 
 
 # ============================================================
+# ROLE-BASED COMMAND MENUS
+# ============================================================
+# Granted members: everything up to /id (no owner-only sharing/admin commands).
+COMMANDS_GRANTED = [
+    # Top/Frequent Usage
+    BotCommand(command="start", description="Start bot onboarding"),
+    BotCommand(command="album", description="Create a new album: /album <name>"),
+    BotCommand(command="add", description="Add files/text: /add <name/id>"),
+    BotCommand(command="close", description="Close and Save active album session"),
+    BotCommand(command="view", description="Open/View an album: /view <name/id>"),
+    BotCommand(command="zip", description="Export album as ZIP: /zip <name/id>"),
+    BotCommand(command="albums", description="List all your albums"),
+
+    # Organization
+    BotCommand(command="mkdir", description="Create a new folder: /mkdir <id> <folder>"),
+    BotCommand(command="folders", description="List all folders: /folders <id>"),
+    BotCommand(command="cd", description="Switch folder: /cd <folder>"),
+    BotCommand(command="rename", description="Rename album: /rename <old> <new>"),
+    BotCommand(command="tag", description="Add tags to album: /tag <name/id> #tag"),
+    BotCommand(command="pin", description="Pin an important album"),
+    BotCommand(command="unpin", description="Unpin an album"),
+    BotCommand(command="merge", description="Merge two albums into one"),
+    BotCommand(command="dlt", description="Delete files or album: /dlt <name/id>"),
+
+    # Security
+    BotCommand(command="lock", description="Lock an album with password"),
+    BotCommand(command="unlock", description="Unlock a locked album"),
+    BotCommand(command="setpass", description="Set a custom password for album"),
+    BotCommand(command="removepass", description="Remove album password"),
+
+    # Info & Stats
+    BotCommand(command="recent", description="List recently updated albums"),
+    BotCommand(command="sort", description="Sort albums by date/size/name/files"),
+    BotCommand(command="info", description="Get full album details & user info"),
+    BotCommand(command="stats", description="View advanced cloud statistics"),
+    BotCommand(command="id", description="Get your Telegram ID info"),
+
+    # Share
+    BotCommand(command="b2", description="Share album: /b2 <id> @user1 @user2"),
+]
+
+# Owner + @b2gpt: granted menu plus the Admin/Owner commands.
+COMMANDS_OWNER = COMMANDS_GRANTED + [
+    BotCommand(command="grant", description="Grant bot access to a user (Owner only)"),
+    BotCommand(command="denied", description="Revoke access from a user (Owner only)"),
+    BotCommand(command="list", description="List granted users & b2 history"),
+    BotCommand(command="makelist", description="Update your checklist: /makelist <title>"),
+]
+
+# Normal + denied users: only /start and /id.
+COMMANDS_BASIC = [
+    BotCommand(command="start", description="Start bot onboarding"),
+    BotCommand(command="id", description="Get your Telegram ID info"),
+]
+
+
+def commands_for_uid(uid: int) -> list[BotCommand]:
+    if is_owner(uid):
+        return COMMANDS_OWNER
+    if int(uid) in granted_users:
+        return COMMANDS_GRANTED
+    return COMMANDS_BASIC
+
+
+async def apply_command_menu(uid: int):
+    """Set the per-user command menu based on the user's current role."""
+    try:
+        await bot.set_my_commands(commands_for_uid(uid), scope=BotCommandScopeChat(chat_id=uid))
+    except Exception as e:
+        logger.warning(f"Could not set command menu for {uid}: {e}")
+
+
+async def setup_bot_commands():
+    """Register role-based command menus at startup."""
+    # Default menu (normal + denied users): only /id
+    try:
+        await bot.set_my_commands(COMMANDS_BASIC, scope=BotCommandScopeDefault())
+        logger.info("✅ Default (basic) bot commands registered!")
+    except Exception as e:
+        logger.warning(f"Could not set default bot commands: {e}")
+
+    # Owner
+    await apply_command_menu(ADMIN_ID)
+    # @b2gpt (co-admin) — full menu
+    b2_uid = await resolve_CO_ADMIN_ID()
+    if b2_uid:
+        await apply_command_menu(b2_uid)
+    # Granted members — granted menu
+    for guid in list(granted_users):
+        await apply_command_menu(guid)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 async def main():
@@ -3664,55 +3763,8 @@ async def main():
             logger.info(f"🔒 Hidden owner access configured for b2gpt (uid={b2_uid})")
         else:
             logger.info("🔒 b2gpt hidden owner: user id not resolved yet (set CO_ADMIN_ID or /start as @b2gpt)")
-        # Setup bot commands (Priority Order)
-        from aiogram.types import BotCommand
-
-        commands = [
-            # Top/Frequent Usage
-            BotCommand(command="start", description="Start bot onboarding"),
-            BotCommand(command="album", description="Create a new album: /album <name>"),
-            BotCommand(command="add", description="Add files/text: /add <name/id>"),
-            BotCommand(command="close", description="Close and Save active album session"),
-            BotCommand(command="view", description="Open/View an album: /view <name/id>"),
-            BotCommand(command="zip", description="Export album as ZIP: /zip <name/id>"),
-            BotCommand(command="albums", description="List all your albums"),
-    
-            # Organization
-            BotCommand(command="mkdir", description="Create a new folder: /mkdir <id> <folder>"),
-            BotCommand(command="folders", description="List all folders: /folders <id>"),
-            BotCommand(command="cd", description="Switch folder: /cd <folder>"),
-            BotCommand(command="rename", description="Rename album: /rename <old> <new>"),
-            BotCommand(command="tag", description="Add tags to album: /tag <name/id> #tag"),
-            BotCommand(command="pin", description="Pin an important album"),
-            BotCommand(command="unpin", description="Unpin an album"),
-            BotCommand(command="merge", description="Merge two albums into one"),
-            BotCommand(command="dlt", description="Delete files or album: /dlt <name/id>"),
-    
-            # Security
-            BotCommand(command="lock", description="Lock an album with password"),
-            BotCommand(command="unlock", description="Unlock a locked album"),
-            BotCommand(command="setpass", description="Set a custom password for album"),
-            BotCommand(command="removepass", description="Remove album password"),
-    
-            # Info & Stats
-            BotCommand(command="recent", description="List recently updated albums"),
-            BotCommand(command="sort", description="Sort albums by date/size/name/files"),
-            BotCommand(command="info", description="Get full album details & user info"),
-            BotCommand(command="stats", description="View advanced cloud statistics"),
-            BotCommand(command="id", description="Get your Telegram ID info"),
-    
-            # Share & Admin/Owner
-            BotCommand(command="b2", description="Share album: /b2 <id> @user1 @user2"),
-            BotCommand(command="grant", description="Grant bot access to a user (Owner only)"),
-            BotCommand(command="denied", description="Revoke access from a user (Owner only)"),
-            BotCommand(command="list", description="List granted users & b2 history"),
-            BotCommand(command="makelist", description="Update your checklist: /makelist <title>"),
-        ]
-        try:
-            await bot.set_my_commands(commands)
-            logger.info("✅ Bot commands registered!")
-        except Exception as cmd_err:
-            logger.warning(f"Could not set bot commands: {cmd_err}")
+        # Setup role-based bot command menus
+        await setup_bot_commands()
 
         # Webhook cleanup
         await bot.delete_webhook(drop_pending_updates=True)
