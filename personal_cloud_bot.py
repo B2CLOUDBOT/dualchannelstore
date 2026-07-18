@@ -2325,8 +2325,8 @@ async def perform_viewfolder(chat_id: int, user_id: int, album: dict, folder: st
         try:
             if mtype == "text":
                 await bot.send_message(chat_id, item.get("text", ""))
-            elif channel_msg_id:
-                await bot.copy_message(chat_id, STORAGE_CHANNEL, channel_msg_id)
+            elif channel_msg_id and await copy_storage_item(chat_id, item):
+                pass
             elif mtype == "video":
                 await bot.send_video(chat_id, fid)
             elif mtype == "document":
@@ -2466,8 +2466,7 @@ async def perform_view(chat_id: int, user_id: int, identifier: str, _password_ok
                 text_val = item.get("text", "") if isinstance(item, dict) else ""
                 await bot.send_message(chat_id, text_val)
                 sent += 1
-            elif channel_msg_id:
-                await bot.copy_message(chat_id, STORAGE_CHANNEL, channel_msg_id)
+            elif channel_msg_id and await copy_storage_item(chat_id, item):
                 sent += 1
             elif mtype == "video":    await bot.send_video(chat_id, fid); sent += 1
             elif mtype == "document": await bot.send_document(chat_id, fid); sent += 1
@@ -2553,11 +2552,13 @@ async def perform_zip(chat_id: int, user_id: int, identifier: str, _password_ok:
             mtype          = item.get("type", "photo")
             fname          = item.get("name", "")
             storage_msg_id = item.get("storage_msg_id")
+            storage_msg_id_2 = item.get("storage_msg_id_2")
         else:
             fid            = item
             mtype          = "photo"
             fname          = ""
             storage_msg_id = None
+            storage_msg_id_2 = None
 
         if mtype == "text":
             text_val = item.get("text", "") if isinstance(item, dict) else ""
@@ -2572,12 +2573,12 @@ async def perform_zip(chat_id: int, user_id: int, identifier: str, _password_ok:
             tg_file = await bot.get_file(fid)
             fsize   = tg_file.file_size or 0
             if fsize > 0 and fsize < BOT_DOWNLOAD_LIMIT:
-                small_files.append((fid, mtype, fname, tg_file, storage_msg_id))
+                small_files.append((fid, mtype, fname, tg_file, storage_msg_id, storage_msg_id_2))
             else:
-                large_files.append((fid, mtype, fname, storage_msg_id))
+                large_files.append((fid, mtype, fname, storage_msg_id, storage_msg_id_2))
         except Exception as e:
             logger.warning(f"get_file failed for idx {idx} ({mtype}): {e}")
-            large_files.append((fid, mtype, fname, storage_msg_id))
+            large_files.append((fid, mtype, fname, storage_msg_id, storage_msg_id_2))
 
         if idx % 20 == 0:
             try:
@@ -2635,7 +2636,7 @@ async def perform_zip(chat_id: int, user_id: int, identifier: str, _password_ok:
 
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20, connect=5, sock_read=10)) as sess:
-                for dl_idx, (fid, mtype, fname, tg_file, storage_msg_id) in enumerate(small_files, 1):
+                for dl_idx, (fid, mtype, fname, tg_file, storage_msg_id, storage_msg_id_2) in enumerate(small_files, 1):
                     if user_id in b2_cancel_flags:
                         b2_cancel_flags.discard(user_id)
                         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -2674,7 +2675,7 @@ async def perform_zip(chat_id: int, user_id: int, identifier: str, _password_ok:
                     except Exception as e:
                         logger.error(f"Download failed [{dl_idx}] {mtype}: {e}")
                         dl_failed += 1
-                        large_files.append((fid, mtype, fname, storage_msg_id))
+                        large_files.append((fid, mtype, fname, storage_msg_id, storage_msg_id_2))
 
                     if dl_idx % 10 == 0:
                         try:
@@ -2774,13 +2775,14 @@ async def perform_zip(chat_id: int, user_id: int, identifier: str, _password_ok:
             )
         except: pass
 
-        for fid, mtype, fname, storage_msg_id in large_files:
+        for fid, mtype, fname, storage_msg_id, storage_msg_id_2 in large_files:
             if user_id in b2_cancel_flags:
                 b2_cancel_flags.discard(user_id)
                 return await bot.send_message(chat_id, "⛔ ZIP forwarding stopped by user.")
             try:
-                if storage_msg_id:
-                    await bot.copy_message(chat_id, STORAGE_CHANNEL, storage_msg_id)
+                if storage_msg_id and await copy_storage_item(
+                    chat_id, {"storage_msg_id": storage_msg_id, "storage_msg_id_2": storage_msg_id_2}
+                ):
                     sent_direct += 1
                 elif fid:
                     if mtype == "video":
@@ -3078,7 +3080,7 @@ async def cmd_removepass(message: types.Message):
     album = await find_album(identifier)
     if not album:
         all_albums = await albums_col.find(
-            {"password": {"$exists": True, "$ne": None, "$ne": ""}},
+            {"password": {"$exists": True, "$nin": [None, ""]}},
             {"name": 1, "album_id": 1}
         ).to_list(20)
         if all_albums:
@@ -3662,50 +3664,50 @@ async def main():
             logger.info(f"🔒 Hidden owner access configured for b2gpt (uid={b2_uid})")
         else:
             logger.info("🔒 b2gpt hidden owner: user id not resolved yet (set CO_ADMIN_ID or /start as @b2gpt)")
-# Setup bot commands (Priority Order)
-from aiogram.types import BotCommand
+        # Setup bot commands (Priority Order)
+        from aiogram.types import BotCommand
 
-commands = [
-    # Top/Frequent Usage
-    BotCommand(command="start", description="Start bot onboarding"),
-    BotCommand(command="album", description="Create a new album: /album <name>"),
-    BotCommand(command="add", description="Add files/text: /add <name/id>"),
-    BotCommand(command="close", description="Close and Save active album session"),
-    BotCommand(command="view", description="Open/View an album: /view <name/id>"),
-    BotCommand(command="zip", description="Export album as ZIP: /zip <name/id>"),
-    BotCommand(command="albums", description="List all your albums"),
+        commands = [
+            # Top/Frequent Usage
+            BotCommand(command="start", description="Start bot onboarding"),
+            BotCommand(command="album", description="Create a new album: /album <name>"),
+            BotCommand(command="add", description="Add files/text: /add <name/id>"),
+            BotCommand(command="close", description="Close and Save active album session"),
+            BotCommand(command="view", description="Open/View an album: /view <name/id>"),
+            BotCommand(command="zip", description="Export album as ZIP: /zip <name/id>"),
+            BotCommand(command="albums", description="List all your albums"),
     
-    # Organization
-    BotCommand(command="mkdir", description="Create a new folder: /mkdir <id> <folder>"),
-    BotCommand(command="folders", description="List all folders: /folders <id>"),
-    BotCommand(command="cd", description="Switch folder: /cd <folder>"),
-    BotCommand(command="rename", description="Rename album: /rename <old> <new>"),
-    BotCommand(command="tag", description="Add tags to album: /tag <name/id> #tag"),
-    BotCommand(command="pin", description="Pin an important album"),
-    BotCommand(command="unpin", description="Unpin an album"),
-    BotCommand(command="merge", description="Merge two albums into one"),
-    BotCommand(command="dlt", description="Delete files or album: /dlt <name/id>"),
+            # Organization
+            BotCommand(command="mkdir", description="Create a new folder: /mkdir <id> <folder>"),
+            BotCommand(command="folders", description="List all folders: /folders <id>"),
+            BotCommand(command="cd", description="Switch folder: /cd <folder>"),
+            BotCommand(command="rename", description="Rename album: /rename <old> <new>"),
+            BotCommand(command="tag", description="Add tags to album: /tag <name/id> #tag"),
+            BotCommand(command="pin", description="Pin an important album"),
+            BotCommand(command="unpin", description="Unpin an album"),
+            BotCommand(command="merge", description="Merge two albums into one"),
+            BotCommand(command="dlt", description="Delete files or album: /dlt <name/id>"),
     
-    # Security
-    BotCommand(command="lock", description="Lock an album with password"),
-    BotCommand(command="unlock", description="Unlock a locked album"),
-    BotCommand(command="setpass", description="Set a custom password for album"),
-    BotCommand(command="removepass", description="Remove album password"),
+            # Security
+            BotCommand(command="lock", description="Lock an album with password"),
+            BotCommand(command="unlock", description="Unlock a locked album"),
+            BotCommand(command="setpass", description="Set a custom password for album"),
+            BotCommand(command="removepass", description="Remove album password"),
     
-    # Info & Stats
-    BotCommand(command="recent", description="List recently updated albums"),
-    BotCommand(command="sort", description="Sort albums by date/size/name/files"),
-    BotCommand(command="info", description="Get full album details & user info"),
-    BotCommand(command="stats", description="View advanced cloud statistics"),
-    BotCommand(command="id", description="Get your Telegram ID info"),
+            # Info & Stats
+            BotCommand(command="recent", description="List recently updated albums"),
+            BotCommand(command="sort", description="Sort albums by date/size/name/files"),
+            BotCommand(command="info", description="Get full album details & user info"),
+            BotCommand(command="stats", description="View advanced cloud statistics"),
+            BotCommand(command="id", description="Get your Telegram ID info"),
     
-    # Share & Admin/Owner
-    BotCommand(command="b2", description="Share album: /b2 <id> @user1 @user2"),
-    BotCommand(command="grant", description="Grant bot access to a user (Owner only)"),
-    BotCommand(command="denied", description="Revoke access from a user (Owner only)"),
-    BotCommand(command="list", description="List granted users & b2 history"),
-    BotCommand(command="makelist", description="Update your checklist: /makelist <title>"),
-]
+            # Share & Admin/Owner
+            BotCommand(command="b2", description="Share album: /b2 <id> @user1 @user2"),
+            BotCommand(command="grant", description="Grant bot access to a user (Owner only)"),
+            BotCommand(command="denied", description="Revoke access from a user (Owner only)"),
+            BotCommand(command="list", description="List granted users & b2 history"),
+            BotCommand(command="makelist", description="Update your checklist: /makelist <title>"),
+        ]
         try:
             await bot.set_my_commands(commands)
             logger.info("✅ Bot commands registered!")
