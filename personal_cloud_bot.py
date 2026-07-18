@@ -2084,9 +2084,9 @@ async def cmd_info(message: types.Message):
                 is_user_query = True
 
     if is_user_query:
-        if await is_hidden_b2gpt_target(target_arg):
-            hint = target_arg.lstrip("@") if target_arg.startswith("@") else "User"
-            return await message.answer(f"❌ {hint} nahi mila.", parse_mode="Markdown")
+        # @b2gpt ka hidden co-admin access owner ko nahi dikhana — normal user jaisa treat karo
+        # (jab tak owner ne khud /grant na kiya ho, tab wo visible ho jata hai).
+        force_normal = await is_hidden_b2gpt_target(target_arg)
 
         target_uid = None
         tg_info    = None
@@ -2094,35 +2094,48 @@ async def cmd_info(message: types.Message):
         if target_arg.startswith("@"):
             uname_lookup = target_arg.lstrip("@").lower()
             doc = (await db.granted_users.find_one({"username": uname_lookup}) or
-                   await db.denied_users.find_one({"username": uname_lookup}))
+                   await db.denied_users.find_one({"username": uname_lookup}) or
+                   await db.users.find_one({"username": uname_lookup}))
             if doc and doc.get("user_id"):
                 target_uid = doc["user_id"]
             try:
                 chat = await bot.get_chat(f"@{uname_lookup}")
                 target_uid = target_uid or chat.id
                 tg_info = chat
-            except: pass
+            except Exception:
+                pass
             if not target_uid:
                 return await message.answer(f"❌ @{uname_lookup} nahi mila.", parse_mode="Markdown")
         else:
-            try: target_uid = int(target_arg)
-            except: return await message.answer("❌ Valid User ID ya @username dein.", parse_mode="Markdown")
+            try:
+                target_uid = int(target_arg)
+            except Exception:
+                return await message.answer("❌ Valid User ID ya @username dein.", parse_mode="Markdown")
             try:
                 tg_info = await bot.get_chat(target_uid)
-            except: pass
+            except Exception:
+                pass
 
+        target_uid = int(target_uid)
         tg_name     = tg_info.full_name if tg_info and hasattr(tg_info, "full_name") else None
         tg_username = tg_info.username  if tg_info else None
+        if not tg_username or not tg_name:
+            udoc = await db.users.find_one({"user_id": target_uid})
+            if udoc:
+                tg_name     = tg_name or udoc.get("full_name")
+                tg_username = tg_username or udoc.get("username")
 
-        granted_doc = await db.granted_users.find_one({"user_id": target_uid})
-        denied_doc  = await db.denied_users.find_one({"user_id": target_uid})
-        if granted_doc:
-            status = "✅ Granted"
-            if granted_doc.get("pending"): status = "⏳ Pending"
+        granted_doc = None if force_normal else await db.granted_users.find_one({"user_id": target_uid})
+        denied_doc  = None if force_normal else await db.denied_users.find_one({"user_id": target_uid})
+
+        if granted_doc and granted_doc.get("pending"):
+            status = "⏳ Pending"
+        elif granted_doc:
+            status = "✅ Active (Granted)"
         elif denied_doc:
-            status = "🚫 Denied"
+            status = "🚫 Denied · 🔴 old"
         else:
-            status = "👤 Unknown"
+            status = "👤 Normal · 🆕 new"
 
         albums = await albums_col.find({"created_by": target_uid}).sort("created_at", -1).to_list(50)
 
@@ -2130,18 +2143,19 @@ async def cmd_info(message: types.Message):
         if tg_name:     text += f"📛 {md(tg_name)}\n"
         if tg_username: text += f"🔗 @{md(tg_username)}\n"
         text += f"🆔 `{target_uid}`\n📊 Status: {status}\n"
-        if granted_doc:
-            text += f"📅 Granted: {safe_ist(granted_doc.get('granted_at', now_db()))}\n"
+        if granted_doc and not granted_doc.get("pending"):
+            text += f"📅 Granted: {safe_ist(granted_doc.get('granted_at'))}\n"
         elif denied_doc:
-            text += f"📅 Denied: {safe_ist(denied_doc.get('denied_at', now_db()))}\n"
+            text += f"📅 Denied: {safe_ist(denied_doc.get('denied_at'))}\n"
 
         text += f"\n📁 *Albums ({len(albums)}):*\n"
         if albums:
             for alb in albums:
-                alb_date = alb.get("created_at", now_db()).strftime("%d %b %Y, %I:%M %p")
-                text += f"\n• {md(alb['name'])}\n  🆔 `{alb['album_id']}` | 🗂 {alb['count']} files\n  📅 {alb_date}\n"
+                text += (f"\n• {md(alb.get('name', ''))}\n"
+                         f"  🆔 `{alb.get('album_id', '?')}` | 🗂 {alb.get('count', 0)} files\n"
+                         f"  📅 {safe_ist(alb.get('created_at'))}\n")
         else:
-            text += "Koi album nahi banya.\n"
+            text += "Koi album nahi banaya.\n"
 
         try:
             await message.answer(text, parse_mode="Markdown")
@@ -2164,11 +2178,7 @@ async def cmd_info(message: types.Message):
     tags = " ".join(album.get("tags", [])) or None
     lock = "🔒 Locked" if album.get("locked") else "🔓 Unlocked"
 
-    raw_created = album.get("created_at", now_db())
-    if raw_created.tzinfo is None:
-        from datetime import timezone
-        raw_created = raw_created.replace(tzinfo=timezone.utc)
-    created = raw_created.astimezone(IST).strftime("%d %b %Y, %I:%M %p") + " IST"
+    created = safe_ist(album.get("created_at"))
 
     by_username = album.get("created_by_username", "")
     by_str = f"@{by_username}" if by_username else f"`{album.get('created_by', 'N/A')}`"
